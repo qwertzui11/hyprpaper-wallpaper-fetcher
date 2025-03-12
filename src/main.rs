@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use reqwest::header;
 use thiserror::Error;
 use tokio::time::sleep;
+use tracing::{debug, info, warn};
 
 #[derive(Error, Debug)]
 pub enum WallpaperError {
@@ -12,6 +13,8 @@ pub enum WallpaperError {
     ConfigDir,
     #[error("could not read api key")]
     ReadApiKey(std::io::Error),
+    #[error("Unsuccessful request status code")]
+    Response(reqwest::StatusCode),
     #[error("hyprctl failed")]
     Hyprctl(std::io::Error),
     #[error("hyprpaper failed")]
@@ -28,6 +31,8 @@ type WallpaperResult<T> = Result<T, WallpaperError>;
 
 #[tokio::main]
 async fn main() -> WallpaperResult<()> {
+    tracing_subscriber::fmt::init();
+
     let auth = auth_key()?;
     let retry_count = 10;
     for _ in 0..retry_count {
@@ -36,7 +41,7 @@ async fn main() -> WallpaperResult<()> {
             Ok(_) => return Ok(()),
             Err(err) => match err {
                 WallpaperError::Reqwest(err) => {
-                    println!(
+                    warn!(
                         "failed to request wallpaper with error `{:?}`, ignoring",
                         err
                     )
@@ -53,7 +58,7 @@ async fn download_photo(auth: &str) -> WallpaperResult<()> {
     // https://rust-lang-nursery.github.io/rust-cookbook/web/clients/apis.html
     let request_url =
         "https://api.unsplash.com/photos/random?topics=wallpapers&orientation=landscape";
-    println!("getting {}", request_url);
+    debug!("getting {}", request_url);
     let mut headers = header::HeaderMap::new();
     headers.insert(
         header::AUTHORIZATION,
@@ -64,61 +69,60 @@ async fn download_photo(auth: &str) -> WallpaperResult<()> {
         .build()?;
     let random = do_request(&client, request_url).await?;
     let random = random.json::<RandomResponse>().await?;
-    let photo = random.urls.full;
-    println!("getting: {}", photo);
-    let photo = do_request(&client, &photo).await?;
+    let photo_url = random.urls.full;
+    info!(
+        "getting a wallpaper from '{}' with the resolution {}x{}. url: '{}'",
+        random.user.name, random.width, random.height, photo_url
+    );
+    let photo = do_request(&client, &photo_url).await?;
     let photo = photo.bytes().await?;
     let photo_file = photo_file_path()?;
     std::fs::write(photo_file.clone(), photo).map_err(WallpaperError::CouldNotWriteImage)?;
-    println!("setting: {:?}", photo_file);
-    println!(
-        "{:?}",
-        std::process::Command::new("hyprctl")
-            .arg("hyprpaper")
-            .arg("unload")
-            .arg(photo_file.clone())
-            .output()
-            .map_err(WallpaperError::Hyprctl)?
-    );
-    println!(
-        "{:?}",
-        std::process::Command::new("hyprctl")
-            .arg("hyprpaper")
-            .arg("preload")
-            .arg(photo_file.clone())
-            .output()
-            .map_err(WallpaperError::Hyprpaper)?
-    );
-    println!(
-        "{:?}",
-        std::process::Command::new("hyprctl")
-            .arg("hyprpaper")
-            .arg("wallpaper")
-            .arg(format!(",{}", photo_file.to_str().unwrap()))
-            .output()
-            .map_err(WallpaperError::Hyprpaper)?
-    );
+    debug!("setting: {:?}", photo_file);
+    let result = std::process::Command::new("hyprctl")
+        .arg("hyprpaper")
+        .arg("unload")
+        .arg(photo_file.clone())
+        .output()
+        .map_err(WallpaperError::Hyprctl)?;
+    debug!("{:?}", result);
+    let result = std::process::Command::new("hyprctl")
+        .arg("hyprpaper")
+        .arg("preload")
+        .arg(photo_file.clone())
+        .output()
+        .map_err(WallpaperError::Hyprpaper)?;
+    debug!("{:?}", result);
+    let result = std::process::Command::new("hyprctl")
+        .arg("hyprpaper")
+        .arg("wallpaper")
+        .arg(format!(",{}", photo_file.to_str().unwrap()))
+        .output()
+        .map_err(WallpaperError::Hyprpaper)?;
+    debug!("{:?}", result);
     Ok(())
 }
 
-async fn do_request(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<reqwest::Response, reqwest::Error> {
+async fn do_request(client: &reqwest::Client, url: &str) -> WallpaperResult<reqwest::Response> {
     let response = client.get(url).send().await?;
-    if response.status() != 200 {
-        // TODO: do an error!
-        println!("random.status(): {}", response.status());
+    let status = response.status();
+    if !response.status().is_success() {
+        Err(WallpaperError::Response(status))
+    } else {
+        Ok(response)
     }
-    Ok(response)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct User {
+    name: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct RandomResponse {
-    #[allow(dead_code)]
     width: i32,
-    #[allow(dead_code)]
     height: i32,
+    user: User,
     urls: PhotoSrcResponse,
 }
 
