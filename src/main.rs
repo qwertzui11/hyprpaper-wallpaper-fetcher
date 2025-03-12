@@ -20,6 +20,8 @@ pub enum WallpaperError {
     CouldNotWriteImage(std::io::Error),
     #[error("could set auth token")]
     ParseAuthHeader(reqwest::header::InvalidHeaderValue),
+    #[error("failed to get a wallpaper after {0} tries")]
+    Failed(i32),
 }
 
 type WallpaperResult<T> = Result<T, WallpaperError>;
@@ -30,13 +32,21 @@ async fn main() -> WallpaperResult<()> {
     let retry_count = 10;
     for _ in 0..retry_count {
         let download = download_photo(&auth).await;
-        if download.is_ok() {
-            return Ok(());
-        }
+        match download {
+            Ok(_) => return Ok(()),
+            Err(err) => match err {
+                WallpaperError::Reqwest(err) => {
+                    println!(
+                        "failed to request wallpaper with error `{:?}`, ignoring",
+                        err
+                    )
+                }
+                _ => return Err(err),
+            },
+        };
         sleep(std::time::Duration::from_secs(60)).await;
     }
-    // TODO: return error!
-    Ok(())
+    Err(WallpaperError::Failed(retry_count))
 }
 
 async fn download_photo(auth: &str) -> WallpaperResult<()> {
