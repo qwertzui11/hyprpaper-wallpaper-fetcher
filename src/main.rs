@@ -2,7 +2,7 @@ use reqwest::header;
 use std::path::PathBuf;
 use thiserror::Error;
 use tokio::time::sleep;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Error, Debug)]
 pub enum WallpaperError {
@@ -33,7 +33,7 @@ async fn main() -> WallpaperResult<()> {
     tracing_subscriber::fmt::init();
 
     let auth = auth_key()?;
-    let retry_count = 10;
+    let retry_count = 30;
     for _ in 0..retry_count {
         let download = download_photo(&auth).await;
         match download {
@@ -45,10 +45,13 @@ async fn main() -> WallpaperResult<()> {
                         err
                     )
                 }
-                _ => return Err(err),
+                _ => {
+                    error!("got the error {:?}. Cancelling.", err);
+                    return Err(err);
+                }
             },
         };
-        sleep(std::time::Duration::from_secs(60)).await;
+        sleep(std::time::Duration::from_secs(10)).await;
     }
     Err(WallpaperError::Failed(retry_count))
 }
