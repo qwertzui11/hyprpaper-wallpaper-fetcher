@@ -29,6 +29,22 @@ struct CliOptions {
     verbose: Option<tracing::Level>,
 }
 
+impl std::fmt::Debug for CliOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let masked_api_key = self
+            .api_key
+            .as_ref()
+            .map(|k| '*'.to_string().repeat(k.len()));
+        f.debug_struct("CliOptions")
+            .field("api_key_file", &self.api_key_file)
+            .field("api_key", &masked_api_key)
+            .field("retry_count", &self.retry_count)
+            .field("retry_timeout", &self.retry_timeout)
+            .field("verbose", &self.verbose)
+            .finish()
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum WallpaperError {
     #[error("failed to do a request")]
@@ -57,7 +73,12 @@ type WallpaperResult<T> = Result<T, WallpaperError>;
 async fn main() -> WallpaperResult<()> {
     let cli_options = CliOptions::parse();
 
-    tracing_subscriber::fmt::init();
+    if let Some(level) = cli_options.verbose {
+        tracing_subscriber::fmt().with_max_level(level).init();
+    } else {
+        tracing_subscriber::fmt::init();
+    }
+    debug!("Options: {:?}", cli_options);
 
     let auth = auth_key(&cli_options)?;
     let retry_count = cli_options.retry_count.unwrap_or(30);
@@ -78,7 +99,12 @@ async fn main() -> WallpaperResult<()> {
                 }
             },
         };
-        sleep(std::time::Duration::from_secs(10)).await;
+        sleep(
+            cli_options
+                .retry_timeout
+                .unwrap_or(std::time::Duration::from_secs(10)),
+        )
+        .await;
     }
     Err(WallpaperError::Failed(retry_count))
 }
@@ -165,15 +191,26 @@ fn default_api_key_file_path() -> WallpaperResult<PathBuf> {
     Ok(config_dir.join("unsplash-key"))
 }
 
-fn api_key() -> WallpaperResult<String> {
-    let api_file = default_api_key_file_path()?;
+fn api_key_from_file(cli_options: &CliOptions) -> WallpaperResult<String> {
+    let api_file = if let Some(file) = cli_options.api_key_file.clone() {
+        file
+    } else {
+        default_api_key_file_path()?
+    };
+    debug!("using api-key from file {:?}", api_file);
     let api_key = std::fs::read_to_string(api_file).map_err(WallpaperError::ReadApiKey)?;
     let api_key = api_key.trim().to_owned();
     Ok(api_key)
 }
 
 fn auth_key(cli_options: &CliOptions) -> WallpaperResult<String> {
-    api_key().map(|k| format!("Client-ID {}", k))
+    let key = if let Some(key) = cli_options.api_key.clone() {
+        debug!("using api-key from commandline argument");
+        key
+    } else {
+        api_key_from_file(cli_options)?
+    };
+    Ok(format!("Client-ID {}", key))
 }
 
 fn photo_file_path() -> WallpaperResult<PathBuf> {
