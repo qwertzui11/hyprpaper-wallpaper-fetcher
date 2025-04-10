@@ -1,6 +1,6 @@
 use clap::Parser;
 use humantime::parse_duration;
-use reqwest::header;
+use reqwest::header::{self};
 use std::path::PathBuf;
 use thiserror::Error;
 use tokio::time::sleep;
@@ -16,8 +16,11 @@ struct CliOptions {
     /// `api-key` from https://unsplash.com/developers
     #[arg(long)]
     api_key: Option<String>,
-    /// the topics to search unsplash for. By default `wallpapers` is used. Another example is
-    /// `wallpapers,space`
+    /// the query to search unsplash for. If set it `--topic` is getting ignored.
+    #[arg(long)]
+    query: Option<String>,
+    /// the topic to search unsplash for. By default `wallpapers` is used. You can't use `--topic`
+    /// and `--query` at the same time
     #[arg(long)]
     topics: Option<String>,
     /// Were to save the wallpaper to. By default it is `~/Pictures/hyprpaper-wallpaper.jpeg`
@@ -60,7 +63,7 @@ pub enum WallpaperError {
     ConfigDir,
     #[error("could not read api key")]
     ReadApiKey(std::io::Error),
-    #[error("Unsuccessful request status code")]
+    #[error("Unsuccessful request status code: {:?} {:?}", .0, .0.canonical_reason())]
     Response(reqwest::StatusCode),
     #[error("hyprpaper failed")]
     Hyprpaper(std::io::Error),
@@ -84,22 +87,38 @@ async fn main() -> WallpaperResult<()> {
         tracing_subscriber::fmt::init();
     }
     debug!("Options: {:?}", cli_options);
+    if cli_options.query.is_some() && cli_options.topics.is_some() {
+        warn!("The options `--query` and `--topics` are set. Only `--query` will work");
+    }
 
     let auth = auth_key(&cli_options)?;
+    let mut headers = header::HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        auth.parse().map_err(WallpaperError::ParseAuthHeader)?,
+    );
+    let default_topic = "wallpapers".to_string();
+    let topics = cli_options.topics.clone().unwrap_or(default_topic);
+
     let retry_count = cli_options.retry_count.unwrap_or(30);
     for _ in 0..retry_count {
-        let download = download_photo(&cli_options, &auth).await;
+        let client = reqwest::Client::builder()
+            .default_headers(headers.clone())
+            .build()?;
+        let topic_id = if cli_options.query.is_some() {
+            None
+        } else {
+            topic_to_id(&client, &topics).await?
+        };
+        let download = download_photo(&client, &cli_options, topic_id).await;
         match download {
             Ok(_) => return Ok(()),
             Err(err) => match err {
                 WallpaperError::Reqwest(err) => {
-                    warn!(
-                        "failed to request wallpaper with error `{:?}`, ignoring",
-                        err
-                    )
+                    warn!("failed to request wallpaper with error `{}`, ignoring", err)
                 }
                 _ => {
-                    error!("got the error {:?}. Cancelling.", err);
+                    error!("got the error `{}`. Cancelling.", err);
                     return Err(err);
                 }
             },
@@ -114,22 +133,43 @@ async fn main() -> WallpaperResult<()> {
     Err(WallpaperError::Failed(retry_count))
 }
 
-async fn download_photo(cli_options: &CliOptions, auth: &str) -> WallpaperResult<()> {
-    // https://rust-lang-nursery.github.io/rust-cookbook/web/clients/apis.html
-    let default_topic = "wallpapers".to_string();
-    let topics = cli_options.topics.as_ref().unwrap_or(&default_topic);
-    let request_url =
-        format!("https://api.unsplash.com/photos/random?topics={topics}&orientation=landscape");
+async fn topic_to_id(client: &reqwest::Client, topics: &str) -> WallpaperResult<Option<String>> {
+    if topics.is_empty() {
+        return Ok(None);
+    }
+    let request_url = format!("https://api.unsplash.com/topics?ids={}", topics);
     debug!("getting {}", request_url);
-    let mut headers = header::HeaderMap::new();
-    headers.insert(
-        header::AUTHORIZATION,
-        auth.parse().map_err(WallpaperError::ParseAuthHeader)?,
-    );
-    let client = reqwest::Client::builder()
-        .default_headers(headers)
-        .build()?;
-    let random = do_request(&client, &request_url).await?;
+    let topics_response = do_request(client, &request_url).await?;
+    let topics_response = topics_response.json::<Vec<TopicResponse>>().await?;
+    debug!("found the topics: {:#?}", topics_response);
+    let topics_ids: Vec<String> = topics_response.into_iter().map(|a| a.id).collect();
+    if topics_ids.is_empty() {
+        error!("could not find any of the topics: {}", topics);
+        return Ok(None);
+    }
+    let topics = topics_ids.join(",");
+    Ok(Some(topics))
+}
+
+async fn download_photo(
+    client: &reqwest::Client,
+    cli_options: &CliOptions,
+    topics: Option<String>,
+) -> WallpaperResult<()> {
+    // https://rust-lang-nursery.github.io/rust-cookbook/web/clients/apis.html
+    // TODO: query!
+    let topics = topics
+        .map(|topics| format!("&topics={topics}"))
+        .unwrap_or("".to_string());
+    let query = cli_options
+        .query
+        .as_ref()
+        .map(|query| format!("&query={query}"))
+        .unwrap_or("".to_string());
+    let request_url =
+        format!("https://api.unsplash.com/photos/random?orientation=landscape{query}{topics}");
+    info!("getting {}", request_url);
+    let random = do_request(client, &request_url).await?;
     let random = random.json::<RandomResponse>().await?;
     let photo_url = random.urls.full;
     info!(
@@ -143,7 +183,7 @@ async fn download_photo(cli_options: &CliOptions, auth: &str) -> WallpaperResult
         "Image has the resolution {}x{}. loading url: '{}'",
         random.width, random.height, photo_url
     );
-    let photo = do_request(&client, &photo_url).await?;
+    let photo = do_request(client, &photo_url).await?;
     let photo = photo.bytes().await?;
     let photo_file = photo_file_path(cli_options)?;
     std::fs::write(photo_file.clone(), photo).map_err(WallpaperError::CouldNotWriteImage)?;
@@ -170,7 +210,23 @@ fn exec_hyprpaper(command: &str, arg: &str) -> Result<(), WallpaperError> {
 async fn do_request(client: &reqwest::Client, url: &str) -> WallpaperResult<reqwest::Response> {
     let response = client.get(url).send().await?;
     let status = response.status();
+    if let Some(limit) = response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|a| a.to_str().ok())
+        .and_then(|a| a.parse::<i32>().ok())
+    {
+        let output = format!("{:?} requests left", limit);
+        if limit == 0 {
+            error!("{}", output);
+        } else if limit < 10 {
+            warn!("{}", output);
+        } else {
+            debug!("{}", output);
+        }
+    }
     if !response.status().is_success() {
+        debug!("response: {:#?}", response);
         Err(WallpaperError::Response(status))
     } else {
         Ok(response)
@@ -180,6 +236,17 @@ async fn do_request(client: &reqwest::Client, url: &str) -> WallpaperResult<reqw
 #[derive(Debug, serde::Deserialize)]
 struct User {
     name: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TopicResponse {
+    id: String,
+    #[allow(dead_code)]
+    slug: String,
+    #[allow(dead_code)]
+    title: String,
+    #[allow(dead_code)]
+    description: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
