@@ -13,7 +13,7 @@ Use the rust package manager `cargo` to install *Hyprpaper Unsplash Wallpaper*.
 2. Fetch and build
 
 ```bash
-cargo install --git https://github.com/qwertzui11/hyprpaper-unsplash
+cargo install --git https://github.com/qwertzui11/hyprpaper-wallpaper-fetcher.git
 ```
 
 The resulting binary can be found inside of `~/.cargo/bin`. Afterwards,
